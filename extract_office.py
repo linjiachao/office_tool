@@ -8,10 +8,12 @@ import posixpath
 import re
 import sys
 import traceback
+from dataclasses import dataclass
 
 
 BASE = Path(__file__).resolve().parent
-OUT_DIR = BASE / "converted"
+DEFAULT_OUT_DIR = BASE / "converted"
+SUPPORTED_SUFFIXES = {".xlsx", ".docx"}
 
 NS_XLSX = {
     "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
@@ -21,6 +23,12 @@ NS_DOCX = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+@dataclass
+class ConversionTask:
+    source_path: Path
+    output_dir: Path
 
 
 def safe_filename(name):
@@ -123,13 +131,14 @@ def read_xlsx_sheets(path):
     return sheets
 
 
-def convert_xlsx(path):
+def convert_xlsx(path, output_dir):
     written = []
     sheets = read_xlsx_sheets(path)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     for sheet_name, rows in sheets:
         output_name = f"{path.stem}__{safe_filename(sheet_name)}.csv"
-        output_path = OUT_DIR / output_name
+        output_path = output_dir / output_name
 
         with output_path.open("w", encoding="utf-8-sig", newline="") as file:
             writer = csv.writer(file)
@@ -614,9 +623,10 @@ def clean_markdown_lines(lines):
     return cleaned
 
 
-def convert_docx(path):
-    output_path = OUT_DIR / f"{path.stem}.md"
-    media_dir = OUT_DIR / f"{path.stem}_media"
+def convert_docx(path, output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{path.stem}.md"
+    media_dir = output_dir / f"{path.stem}_media"
     with ZipFile(path) as zip_file:
         image_exporter = DocxImageExporter(zip_file, read_docx_relationships(zip_file), media_dir)
         body_lines = docx_body_to_markdown(zip_file, image_exporter)
@@ -635,35 +645,77 @@ def discover_default_files():
     return files
 
 
-def convert_file(path):
+def output_root_for_folder(folder):
+    return folder.parent / "converted" / safe_filename(folder.name)
+
+
+def output_dir_for_file(path):
+    return path.parent / "converted"
+
+
+def supported_file_paths(folder):
+    files = []
+    for path in folder.rglob("*"):
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
+            files.append(path)
+    return sorted(files)
+
+
+def discover_tasks(argv):
+    if not argv:
+        return [ConversionTask(path, DEFAULT_OUT_DIR) for path in discover_default_files()]
+
+    tasks = []
+    for arg in argv:
+        path = Path(arg).resolve()
+        if not path.exists():
+            tasks.append(ConversionTask(path, DEFAULT_OUT_DIR))
+            continue
+
+        if path.is_dir():
+            folder_output_root = output_root_for_folder(path)
+            for file_path in supported_file_paths(path):
+                relative_parent = file_path.parent.relative_to(path)
+                output_dir = folder_output_root / relative_parent
+                tasks.append(ConversionTask(file_path, output_dir))
+            continue
+
+        tasks.append(ConversionTask(path, output_dir_for_file(path)))
+
+    return tasks
+
+
+def convert_file(path, output_dir):
     suffix = path.suffix.lower()
     if suffix == ".xlsx":
-        return convert_xlsx(path)
+        return convert_xlsx(path, output_dir)
     if suffix == ".docx":
-        return convert_docx(path)
+        return convert_docx(path, output_dir)
     print(f"Skipped unsupported file: {path}")
     return []
 
 
 def main(argv):
-    OUT_DIR.mkdir(exist_ok=True)
+    DEFAULT_OUT_DIR.mkdir(exist_ok=True)
 
-    paths = [Path(arg).resolve() for arg in argv] if argv else discover_default_files()
-    if not paths:
+    tasks = discover_tasks(argv)
+    existing_tasks = [task for task in tasks if task.source_path.exists()]
+    if not existing_tasks:
         print("No .xlsx or .docx files found.")
         return 1
 
     all_written = []
     had_error = False
 
-    for path in paths:
+    for task in tasks:
+        path = task.source_path
         if not path.exists():
             print(f"Missing file: {path}")
             had_error = True
             continue
 
         try:
-            written = convert_file(path)
+            written = convert_file(path, task.output_dir)
             all_written.extend(written)
             if written:
                 print(f"Converted: {path.name}")
@@ -675,7 +727,7 @@ def main(argv):
             traceback.print_exc()
 
     print("")
-    print(f"Output folder: {OUT_DIR}")
+    print(f"Default output folder: {DEFAULT_OUT_DIR}")
     print(f"Files written: {len(all_written)}")
     return 1 if had_error else 0
 
